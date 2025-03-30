@@ -83,17 +83,6 @@ func (rf *Raft) syncLog(peer int) {
 		 */
 		maxIdx = rf.lastEntryIndex() + 1
 
-		/**Offset in rf.logs array, not real index of log entry
-		 * no need double check whether sended log entries was changed, because:
-		 * 	 Double-checking current term after RPC represents that the leader did not malfunction,
-		 * plus Leader never updates/deletes/inserts entry into the prefix of its own log.
-		 * so sended log entris in leader's log are always the same as before.
-		 *   Leader only change log in two cases: Appending new entries into its log after position rf.le;
-		 * Compacting a prefix of applied logs into snapshot.
-		 *
-		 * rf.logs[start:end-1] represents a suffix of leader's log, sending the log suffix later.
-		 * sending an implicit heartbeat if start == end
-		 */
 		start = rf.offset(rf.NextIndex[peer])
 		// end   = rf.le // may changed during RPC, don't depend on its current value
 	)
