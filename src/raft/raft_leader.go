@@ -22,23 +22,6 @@ func (rf *Raft) replicateLogs() {
 		go func(peer int) {
 			for {
 
-				/**Do not Log-Replication for each follower One After One in serializable form.
-				 * reason as below:
-				 *	 serializing Log Replication makes no sense, and slow throughput compared to concurrent.
-				 * RPC caller can't guarantee that callee will receive args in the order that caller sending,
-				 * because of unreliable network.
-				 *   for example: there are both Long-log AE and Short-log AE in the network at the same time,
-				 * although Long-log AE is sent after Short-log AE by leader, (but)follower may receives Long-
-				 * log AE first.
-				 *   in this case, follower may saves long-log first and then replace long log with short log
-				 * that arrived later. the replies of this 2 AE, will arrive Leader in any order also,if leader
-				 * using reply value of short-log AE after reply of long-log AE, it will count wrong agreement
-				 * vote for the discarded log entries by follower.
-				 *
-				 * For solving this, follower's AE handler does not delete log entries that follower can not
-				 * determine as inconsistent
-				 * P.S. AE = appendEntries RPC request
-				 */
 				rf.appendCond.L.Lock()
 				if rf.killed() || rf.status != SLEADER {
 					rf.appendCond.L.Unlock()
@@ -75,55 +58,6 @@ func (rf *Raft) replicateLogs() {
 	// maintain Leader's CommitIndex in background
 	go rf.commitLogs()
 }
-
-// Leader replication Task: replicates its logs into majority of Followers, not all nodes is required.
-// Workflow (In case of no Snapshot) as below:
-// - 1.Leader sends a follower a set of logs that it thinks the follower lost.
-// - 2.If the follower rejects to append/overwrite the logs, leader re-send append RPC with more logs to the follower.
-// - 3.If the follower accepts this logs, it appends/overwrites the logs down its local logs and replies leader with OK.
-// - 4.After getting accepted reply,Leader will increase these logs'agreement vote counters by 1.
-// - 5.Leader will communicates with all nodes by the same upper flow in parallel goroutines.
-// - 6.When Leader detects certain logs'Vote Counter are larger than Majority, Leader can confirm
-// -   that majority of followers have saved these logs in their local logs, so leader commits them
-// -   by moving its CommitIndex point on log array.
-// - 7.But now other followers don't know that leader has gotten majority of votes and committed these logs,
-// -   they still wait for ACK to commit these logs from leader.
-// - 8.Leader attaches this commit-ACK on next append-request RPC(include heartbeat) for saving net bandwith.
-// - 9.When Followers accept append-request, they will use commit-ACK attached in RPC to keep pace with Leader.
-//
-// The Advantage of Raft's Log Replication
-// -   Brute Forcing Log Replication(Data-Full-Sync): Leader sends all logs from 0 to all Followers,
-// - followers save mismatched logs in local this method and consumes more and more bandwith as logs grow.
-// -   Raft Leader sends its log array suffix: sending 1 log first -> if follower rejects -> sending 2 or more logs suffix
-// - sending suffix with more and more logs util follower accept(namely the suffix is lost part of follower's log array).
-// - this approach is based on how to judge fastly Longest Logs Prefix of two logs array by Log Matching Property:
-// - 		follower determines whether prefix of its logs is the same as the prefix of leader's by comparing
-// - 	if last log before the suffix in follower's logs is the same as leader's last log before the suffix,
-// -	if true follower accept the suffix.
-// -
-// - In most case, leader only sends logs newly increased in log queue to majority of peers, saving net i/o
-//
-// when Leader replicates logs into a Follower, it can't assume that the states it maintains for the follower
-// is completely right. state like: NextIndex[i], MatchIndex[i].
-// Leader maybe request a follower with multiple RPCs for determine how many logs need to send to follower,
-// namely determining the missing part of logs of the follower.
-// - 	The only assumption that Leader can do is that its logs contains all committed logs(otherwise can't elected leader),
-// - so it can append or ovrewrite followers'logs that are uncommitted, case like below:
-// - 	A leader received new logs from clients and before commits those logs, it crashed, a new leader activate,
-// - then old leader recover and becomes Follower. In this case, new leader's logs queue is shorter and
-// - older than old leader's. But new leader can still overwrite uncommitted logs in old leader logs.
-
-// A slow raft follower's logs may Far Behind Leader's, because of "majority vote", leader doesn't care whether
-// the slow node saves logs received from leader when leader commits logs
-
-// leader's CommitIndex may change during retring RPC, so peers may get old CommitIndex. it no matter, no one care
-// whether followers'log is committed, only replicating logs in their logs queue is enough for leader and clients
-// to which leader serves.
-
-// Implicit Heartbeat: AE has the effect of explicit heartbeat
-// Heartbeat's effect:
-//  1. suppress other servers trigger election
-//  2. attach leader's CommitIndex to followers to ACK Previous appended log entries
 
 // "Log Matching Property" refers to section 5.3 of original paper
 func (rf *Raft) syncLog(peer int) {
@@ -262,33 +196,6 @@ func (rf *Raft) syncLog(peer int) {
 	}
 }
 
-// the maintaining task of Leader's CommitIndex is split out of workflow of Log-Replication
-//   - find which log entries get majority of vote, namely replicated in majority of followers'log
-//
-// Log-Replication Restriction for Leader
-// for ensuring new elected Leader contains all committed log entries once it's being leader:
-//   - Leader can not replicate old log of old leader into followers
-//   - Leader can not commit old log of old leader
-//   - Leader can replicate and commit its own log ONLY!!!
-//
-// this restriction and the Leader Election Restriction is the guarantee of Leader Completeness Property
-//
-// How to determine if the log belongs to current Leader?
-//   - like determining whether a log is newer than other in Leader Election Restriction
-//     comparing last entry's term and index in log array
-//
-// example:
-//   - log[0,1,2] represents a log: length=3; contains 3 entries/commands;
-//     the number in it are the term of leaders that appended the entry into log.
-//   - this log belongs to the leader in the term 2, because the term of the last entry is 2
-//     it represents that this log was created during term 2 by the old leader.
-//     maybe a newer log[0,1,3] was committed, if current leader replicates and commits log[0,1,2]
-//     it could causes committed log entry with term 3 is overwrote by log entry with 2.
-//   - if current leader of term 6 append a entry into log, it becomes log[0,1,2,6]
-//     so this log belongs to current leader, it can be replicated and committed
-//   - new leaders can not 'immediately' conclude that it was committed if leader don't
-//     do some extra work that communicates with followers. In Raft, Leader doesn't do that work,
-//     upon a node becomes a leader, it can assume that it saved all log from old leader
 func (rf *Raft) commitLogs() {
 	for !rf.killed() {
 		rf.lock()
@@ -337,8 +244,6 @@ func (rf *Raft) commitLogs() {
 	}
 }
 
-// throw newly applied log entries up to upper layer application(namely state machine) by a go channel
-// notice: go channel may blocks, don not hold lock to do time-spent operation
 func (rf *Raft) send2StateMachine(applyCh chan ApplyMsg) {
 	for !rf.killed() {
 
